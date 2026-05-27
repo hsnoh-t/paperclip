@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractCodexRetryNotBefore,
+  isCodexContextLengthExceededError,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
   parseCodexJsonl,
@@ -136,5 +137,54 @@ describe("isCodexTransientUpstreamError", () => {
         ].join("\n"),
       }),
     ).toBe(false);
+  });
+});
+
+describe("isCodexContextLengthExceededError (ARI-407)", () => {
+  it("matches the literal OpenAI context_length_exceeded code", () => {
+    expect(
+      isCodexContextLengthExceededError({
+        errorMessage: '{"error":{"code":"context_length_exceeded","message":"..."}}',
+      }),
+    ).toBe(true);
+  });
+
+  it("matches prose phrasings emitted by the Codex CLI", () => {
+    expect(
+      isCodexContextLengthExceededError({
+        errorMessage:
+          "This model's maximum context length is 200000 tokens. However, your messages resulted in 217340 tokens.",
+      }),
+    ).toBe(true);
+    expect(
+      isCodexContextLengthExceededError({
+        stderr: "Error: input is too long for this model. Try a shorter prompt.",
+      }),
+    ).toBe(true);
+    expect(
+      isCodexContextLengthExceededError({
+        stdout: '{"type":"error","message":"context window exceeded"}',
+      }),
+    ).toBe(true);
+    expect(
+      isCodexContextLengthExceededError({
+        errorMessage: "Request exceeds the model's context window of 200000 tokens.",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not match unrelated transient errors", () => {
+    expect(
+      isCodexContextLengthExceededError({
+        errorMessage: "We're currently experiencing high demand. Please try again later.",
+      }),
+    ).toBe(false);
+    expect(
+      isCodexContextLengthExceededError({
+        errorMessage: "rate limit exceeded; retry after 30s",
+      }),
+    ).toBe(false);
+    expect(isCodexContextLengthExceededError({ errorMessage: "" })).toBe(false);
+    expect(isCodexContextLengthExceededError({})).toBe(false);
   });
 });

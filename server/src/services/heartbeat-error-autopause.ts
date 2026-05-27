@@ -7,6 +7,21 @@ import {
 export const HEARTBEAT_ERROR_AUTOPAUSE_DEFAULT_THRESHOLD = 3;
 export const HEARTBEAT_ERROR_AUTOPAUSE_FLAG = "HEARTBEAT_ERROR_AUTOPAUSE_ENABLED";
 
+// ARI-407 §2.4.4 sliding-window thresholds. Used when consecutive failures may
+// be broken up by interleaved successful runs (e.g. recovery actions) but the
+// underlying failure pattern (context_length_exceeded) still recurs at a high
+// rate. Counted from `coalesce(finishedAt, createdAt)` across HEARTBEAT_RUN_TERMINAL_STATUSES.
+export interface HeartbeatAutoPauseSlidingWindowRule {
+  windowMinutes: number;
+  threshold: number;
+}
+
+export const HEARTBEAT_ERROR_AUTOPAUSE_SLIDING_WINDOW_RULES: Partial<
+  Record<HeartbeatAutoPauseCode, HeartbeatAutoPauseSlidingWindowRule>
+> = {
+  context_length_exceeded: { windowMinutes: 60, threshold: 6 },
+};
+
 export interface HeartbeatAutoPauseRunInput {
   id: string;
   status: string;
@@ -34,6 +49,12 @@ const authFailedRe =
   /(?:auth(?:entication|orization)?\s+(?:failed|required)|unauthori[sz]ed|invalid\s+credentials|not\s+logged\s+in|login\s+required|please\s+(?:log\s+in|authenticate)|requires\s+login|access\s+denied)/i;
 const adapterBootstrapRe =
   /(?:adapter[_\s-]?bootstrap[_\s-]?failed|failed\s+to\s+start\s+command|spawn\s+.+\s+enoent|command\s+not\s+found|no\s+such\s+file\s+or\s+directory|verify\s+adapter\s+command|working\s+directory\s+and\s+path|adapter\s+.+not\s+(?:registered|found)|failed\s+to\s+(?:load|resolve)\s+adapter|bootstrap\s+failed)/i;
+// ARI-407: detect context_length_exceeded across the run record so the guard
+// fires even when the adapter masks the errorCode as "adapter_failed". Match
+// the literal API code, the resultJson errorFingerprint marker, and common
+// human-readable phrasings ("context window", "input too long", etc.).
+const contextLengthExceededRe =
+  /(?:context[_\s-]?length[_\s-]?exceeded|context[_\s-]?window[_\s-]?exceeded|maximum\s+context\s+length|context\s+window\s+(?:too\s+long|exceeded|overflow|is\s+full)|input\s+(?:is\s+)?too\s+long\s+for\s+(?:this|the)\s+model|exceeds?\s+(?:the\s+)?(?:model'?s\s+)?(?:maximum\s+)?context\s+(?:window|length|size))/i;
 
 function normalizeToken(value: unknown) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -82,6 +103,11 @@ function mapDirectErrorCode(code: string): HeartbeatAutoPauseCode | null {
   if (/(?:quota|resource_exhausted)/i.test(code)) return "quota_exceeded";
   if (/(?:rate_limit|too_many_requests|throttl)/i.test(code)) return "rate_limit_exceeded";
   if (/(?:bootstrap|command_not_found|spawn_enoent)/i.test(code)) return "adapter_bootstrap_failed";
+  // ARI-407: adapters set "context_length_exceeded" verbatim; tolerate the dashed
+  // / cased variants too so future emitters do not silently bypass the guard.
+  if (/context[_\s-]?length[_\s-]?exceeded|context[_\s-]?window[_\s-]?exceeded/i.test(code)) {
+    return "context_length_exceeded";
+  }
   return null;
 }
 
@@ -115,6 +141,9 @@ export function normalizeHeartbeatAutoPauseErrorClass(
   if (rateLimitRe.test(haystack)) return "rate_limit_exceeded";
   if (quotaExceededRe.test(haystack)) return "quota_exceeded";
   if (adapterBootstrapRe.test(haystack)) return "adapter_bootstrap_failed";
+  // ARI-407: prose match for context_length_exceeded so the guard fires even
+  // when the adapter masks errorCode as "adapter_failed".
+  if (contextLengthExceededRe.test(haystack)) return "context_length_exceeded";
   return null;
 }
 

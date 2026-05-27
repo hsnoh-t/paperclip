@@ -43,6 +43,7 @@ import {
   extractCodexRetryNotBefore,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
+  isCodexContextLengthExceededError,
 } from "./parse.js";
 import { pathExists, prepareManagedCodexHome, resolveManagedCodexHomeDir, resolveSharedCodexHomeDir } from "./codex-home.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
@@ -789,6 +790,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: attempt.proc.stderr,
         errorMessage: fallbackErrorMessage,
       });
+    const contextLengthExceeded =
+      (attempt.proc.exitCode ?? 0) !== 0 &&
+      isCodexContextLengthExceededError({
+        stdout: attempt.proc.stdout,
+        stderr: attempt.proc.stderr,
+        errorMessage: fallbackErrorMessage,
+      });
+    // ARI-407: when the upstream model rejects the persisted session because the
+    // context window is exhausted, drop the session and force a fresh one on the
+    // next heartbeat. Without this, retries against the same session compact and
+    // immediately re-fail, producing the silent failure loop tracked in ARI-405.
+    const rotateForContextLength = contextLengthExceeded;
+    const previousSessionIdForRotation =
+      runtimeSessionId || runtime.sessionId || resolvedSessionId || null;
 
     return {
       exitCode: attempt.proc.exitCode,
@@ -799,15 +814,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? null
           : fallbackErrorMessage,
       errorCode:
-        transientUpstream
-          ? "codex_transient_upstream"
-          : null,
+        contextLengthExceeded
+          ? "context_length_exceeded"
+          : transientUpstream
+            ? "codex_transient_upstream"
+            : null,
       errorFamily: transientUpstream ? "transient_upstream" : null,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       usage: attempt.parsed.usage,
-      sessionId: resolvedSessionId,
-      sessionParams: resolvedSessionParams,
-      sessionDisplayId: resolvedSessionId,
+      sessionId: rotateForContextLength ? null : resolvedSessionId,
+      sessionParams: rotateForContextLength ? null : resolvedSessionParams,
+      sessionDisplayId: rotateForContextLength ? null : resolvedSessionId,
       provider: "openai",
       biller: resolveCodexBiller(effectiveEnv, billingType),
       model,
@@ -819,9 +836,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
         ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
         ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+        ...(contextLengthExceeded
+          ? {
+              errorFingerprint: "context_length_exceeded",
+              sessionRotationReason: "context_length_exceeded",
+              sessionRotated: true,
+              ...(previousSessionIdForRotation
+                ? { previousSessionId: previousSessionIdForRotation }
+                : {}),
+            }
+          : {}),
       },
       summary: attempt.parsed.summary,
-      clearSession: Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
+      clearSession: Boolean(
+        rotateForContextLength ||
+          ((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
+      ),
     };
   };
 
@@ -839,6 +869,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
       const retry = await runAttempt(null);
       return toResult(retry, true, true);
+    }
+
+    // ARI-407: surface a single log line when the upstream model rejects the
+    // persisted session for context-window reasons. Do NOT auto-retry — the
+    // same prompt against the same persisted state will only re-fail.
+    if (
+      !initial.proc.timedOut &&
+      (initial.proc.exitCode ?? 0) !== 0 &&
+      isCodexContextLengthExceededError({
+        stdout: initial.proc.stdout,
+        stderr: initial.proc.stderr,
+        errorMessage: initial.parsed.errorMessage ?? null,
+      })
+    ) {
+      const rotatedFromSession = sessionId || runtimeSessionId || runtime.sessionId || null;
+      await onLog(
+        "stdout",
+        `[paperclip] Codex reported context_length_exceeded` +
+          (rotatedFromSession ? ` for session "${rotatedFromSession}"` : "") +
+          `; dropping the session so the next heartbeat starts fresh (no in-heartbeat retry).\n`,
+      );
     }
 
     return toResult(initial, false, false);

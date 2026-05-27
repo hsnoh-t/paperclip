@@ -116,6 +116,7 @@ import { agentService } from "./agents.js";
 import {
   buildHeartbeatAutoPauseDigest,
   buildHeartbeatAutoPauseFingerprint,
+  HEARTBEAT_ERROR_AUTOPAUSE_SLIDING_WINDOW_RULES,
   normalizeHeartbeatAutoPauseErrorClass,
   resolveHeartbeatErrorAutoPausePolicy,
   type HeartbeatErrorAutoPausePolicy,
@@ -4669,15 +4670,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (consecutiveRuns.length >= triggerThreshold) break;
     }
 
-    if (consecutiveRuns.length < triggerThreshold) {
-      return { outcome: "below_threshold", count: consecutiveRuns.length, threshold, code };
+    // ARI-407 §2.4.4 sliding-window override. For codes that recur silently
+    // (e.g. context_length_exceeded that the adapter masks as
+    // "adapter_failed"), interleaved successes/other-codes can keep the
+    // consecutive counter low while the underlying loop runs hot. When a rule
+    // is configured for this code, count matching runs whose
+    // coalesce(finishedAt, createdAt) falls within `windowMinutes` and treat
+    // it as a trigger if it meets `threshold`. Runs we already counted in the
+    // consecutive pass are deduped.
+    const slidingWindowRule = HEARTBEAT_ERROR_AUTOPAUSE_SLIDING_WINDOW_RULES[code];
+    let slidingWindowRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+    if (slidingWindowRule && consecutiveRuns.length < triggerThreshold) {
+      const windowStart = new Date(
+        runFinishedAt.getTime() - slidingWindowRule.windowMinutes * 60_000,
+      );
+      for (const candidate of recentRuns) {
+        const candidateFinishedAt =
+          candidate.finishedAt ?? candidate.createdAt ?? null;
+        if (!candidateFinishedAt) continue;
+        if (new Date(candidateFinishedAt).getTime() < windowStart.getTime()) break;
+        if (candidate.status === "succeeded") continue;
+        const candidateCode = normalizeHeartbeatAutoPauseErrorClass({
+          id: candidate.id,
+          status: candidate.status,
+          error: candidate.error,
+          errorCode: candidate.errorCode,
+          resultJson: parseObject(candidate.resultJson),
+        });
+        if (candidateCode !== code) continue;
+        slidingWindowRuns.push(candidate);
+        if (slidingWindowRuns.length >= slidingWindowRule.threshold) break;
+      }
     }
 
-    const firstRun = consecutiveRuns[consecutiveRuns.length - 1]!;
+    const slidingWindowTriggered =
+      slidingWindowRule != null &&
+      slidingWindowRuns.length >= slidingWindowRule.threshold;
+
+    if (consecutiveRuns.length < triggerThreshold && !slidingWindowTriggered) {
+      return {
+        outcome: "below_threshold",
+        count: consecutiveRuns.length,
+        threshold,
+        code,
+      };
+    }
+
+    const triggerRuns = slidingWindowTriggered ? slidingWindowRuns : consecutiveRuns;
+    const firstRun = triggerRuns[triggerRuns.length - 1]!;
+    const reportedCount = slidingWindowTriggered ? slidingWindowRuns.length : consecutiveRuns.length;
+    const reportedThreshold = slidingWindowTriggered
+      ? slidingWindowRule!.threshold
+      : triggerThreshold;
+    const triggerKind = slidingWindowTriggered ? ("sliding_window" as const) : ("consecutive" as const);
     const updatedAgent = await agentsSvc.recordHeartbeatAutoPause(agent.id, {
       code,
       adapter: agent.adapterType,
-      consecutiveErrorCount: consecutiveRuns.length,
+      consecutiveErrorCount: reportedCount,
       firstRunId: firstRun.id,
       lastRunId: run.id,
       sampleDigest,
@@ -4690,7 +4739,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: "heartbeat auto-pause guard가 동일 오류 연속 실패를 감지해 timer heartbeat를 비활성화했습니다.",
+      message: slidingWindowTriggered
+        ? "heartbeat auto-pause guard가 sliding-window 임계값(ARI-407 §2.4.4)을 감지해 timer heartbeat를 비활성화했습니다."
+        : "heartbeat auto-pause guard가 동일 오류 연속 실패를 감지해 timer heartbeat를 비활성화했습니다.",
       payload: {
         guardVersion: "heartbeat-error-autopause/v1",
         sourceIssueId: "ARI-103",
@@ -4699,6 +4750,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         consecutiveErrorCount: consecutiveRuns.length,
         threshold: triggerThreshold,
         configuredThreshold: threshold,
+        triggerKind,
+        ...(slidingWindowRule
+          ? {
+              slidingWindowMinutes: slidingWindowRule.windowMinutes,
+              slidingWindowThreshold: slidingWindowRule.threshold,
+              slidingWindowCount: slidingWindowRuns.length,
+              metricTag: "ari_407_2_4_4",
+            }
+          : {}),
         firstRunId: firstRun.id,
         lastRunId: run.id,
         sampleDigest,
@@ -4719,8 +4779,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       code,
       adapter: agent.adapterType,
-      count: consecutiveRuns.length,
-      threshold: triggerThreshold,
+      count: reportedCount,
+      threshold: reportedThreshold,
       firstRunId: firstRun.id,
       lastRunId: run.id,
       sampleDigest,
@@ -4736,8 +4796,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return {
       outcome: "paused",
       code,
-      count: consecutiveRuns.length,
-      threshold: triggerThreshold,
+      count: reportedCount,
+      threshold: reportedThreshold,
       firstRunId: firstRun.id,
       lastRunId: run.id,
       sampleDigest,

@@ -60,6 +60,35 @@ describe("heartbeat error auto-pause 정규화", () => {
     })).toBeNull();
   });
 
+  it("ARI-407: context_length_exceeded를 errorCode/error/resultJson 어디에서든 감지한다", () => {
+    expect(normalizeHeartbeatAutoPauseErrorClass({
+      id: randomUUID(),
+      status: "failed",
+      errorCode: "context_length_exceeded",
+      error: "openai responded with code=context_length_exceeded",
+      resultJson: null,
+    })).toBe("context_length_exceeded");
+
+    expect(normalizeHeartbeatAutoPauseErrorClass({
+      id: randomUUID(),
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: null,
+      resultJson: {
+        errorFingerprint: "context_length_exceeded",
+        sessionRotationReason: "context_length_exceeded",
+      },
+    })).toBe("context_length_exceeded");
+
+    expect(normalizeHeartbeatAutoPauseErrorClass({
+      id: randomUUID(),
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: "This model's maximum context length is 200000 tokens.",
+      resultJson: null,
+    })).toBe("context_length_exceeded");
+  });
+
   it("feature flag false 값은 guard를 비활성화한다", () => {
     expect(resolveHeartbeatErrorAutoPausePolicy({ HEARTBEAT_ERROR_AUTOPAUSE_ENABLED: "false" }).enabled).toBe(false);
     expect(resolveHeartbeatErrorAutoPausePolicy({ HEARTBEAT_ERROR_AUTOPAUSE_ENABLED: "1" }).enabled).toBe(true);
@@ -323,6 +352,123 @@ describeEmbeddedPostgres("heartbeat error auto-pause guard", () => {
     });
     expect(resumedResult).toMatchObject({ outcome: "below_threshold", count: 1 });
     expect(((await readRuntimeConfig(resumed.agentId)).heartbeat as Record<string, unknown>).enabled).toBe(true);
+  });
+
+  it("ARI-407 §2.4.4: context_length_exceeded 60분 내 6회 sliding window가 발화한다", async () => {
+    const { companyId, agentId } = await seedAgent({ adapterType: "codex_local" });
+    const issueId = await seedIssue({ companyId, agentId });
+    const ctxError = "This model's maximum context length is 200000 tokens.";
+
+    // 의도: consecutive 가드가 발화하지 않는(<3) 패턴을 만들고, 60분 window 내 실패 ≥6 으로
+    // sliding-window 가드만 단독 발화시킨다. 가장 최근 run 직전에 성공 run을 끼워 넣어
+    // 연속 카운터를 1로 묶어 두는 것이 핵심이다.
+    const failTimes = [
+      "2026-05-26T00:00:00.000Z",
+      "2026-05-26T00:05:00.000Z",
+      "2026-05-26T00:10:00.000Z",
+      "2026-05-26T00:15:00.000Z",
+      "2026-05-26T00:20:00.000Z",
+      "2026-05-26T00:25:00.000Z",
+    ];
+    for (const at of failTimes) {
+      await seedRun({
+        companyId,
+        agentId,
+        issueId,
+        at,
+        errorCode: "adapter_failed",
+        error: ctxError,
+      });
+    }
+    // 마지막 트리거 직전에 성공 → 연속 카운터를 깬다.
+    await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      at: "2026-05-26T00:30:00.000Z",
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+    });
+    const triggerRunId = await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      at: "2026-05-26T00:40:00.000Z",
+      errorCode: "adapter_failed",
+      error: ctxError,
+    });
+
+    const result = await heartbeat.applyHeartbeatErrorAutoPause(triggerRunId, {
+      policy: { enabled: true, threshold: 3 },
+    });
+
+    expect(result.outcome).toBe("paused");
+    expect(result.code).toBe("context_length_exceeded");
+    // sliding window가 60분 안에서 6+1 = 7회를 잡아 threshold=6에 도달하면 즉시 발화.
+    expect((result as { count?: number }).count).toBeGreaterThanOrEqual(6);
+    expect((result as { threshold?: number }).threshold).toBe(6);
+    expect(((await readRuntimeConfig(agentId)).heartbeat as Record<string, unknown>).enabled).toBe(false);
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, triggerRunId));
+    const guardEvent = events.find((event) => event.message?.includes("heartbeat auto-pause guard"));
+    expect(guardEvent).toBeDefined();
+    const payload = guardEvent?.payload as Record<string, unknown> | null;
+    expect(payload?.triggerKind).toBe("sliding_window");
+    expect(payload?.slidingWindowMinutes).toBe(60);
+    expect(payload?.slidingWindowThreshold).toBe(6);
+    expect(payload?.metricTag).toBe("ari_407_2_4_4");
+  });
+
+  it("ARI-407: context_length_exceeded가 3회 연속이면 기존 consecutive 가드로 발화한다", async () => {
+    const { companyId, agentId } = await seedAgent({ adapterType: "codex_local" });
+    const issueId = await seedIssue({ companyId, agentId });
+    const ctxError = "openai error code=context_length_exceeded";
+
+    await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      at: "2026-05-26T01:00:00.000Z",
+      errorCode: "adapter_failed",
+      error: ctxError,
+    });
+    await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      at: "2026-05-26T01:01:00.000Z",
+      errorCode: "adapter_failed",
+      error: ctxError,
+    });
+    const triggerRunId = await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      at: "2026-05-26T01:02:00.000Z",
+      errorCode: "adapter_failed",
+      error: ctxError,
+    });
+
+    const result = await heartbeat.applyHeartbeatErrorAutoPause(triggerRunId, {
+      policy: { enabled: true, threshold: 3 },
+    });
+
+    expect(result).toMatchObject({
+      outcome: "paused",
+      code: "context_length_exceeded",
+      count: 3,
+      threshold: 3,
+    });
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, triggerRunId));
+    const guardEvent = events.find((event) => event.message?.includes("heartbeat auto-pause guard"));
+    expect((guardEvent?.payload as Record<string, unknown> | null)?.triggerKind).toBe("consecutive");
   });
 
   it("수동 재개 후 24시간 내 동일 fingerprint는 N=1로 재발화하고 alert comment를 디바운스한다", async () => {

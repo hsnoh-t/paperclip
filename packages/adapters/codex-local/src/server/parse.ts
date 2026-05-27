@@ -10,6 +10,11 @@ const CODEX_TRANSIENT_UPSTREAM_RE =
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
 const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
+// Detect OpenAI context_length_exceeded responses. The Codex client surfaces this
+// either as the literal API error code (preferred) or as a "context window" /
+// "too long" / "maximum context length" prose error in the JSONL error stream.
+const CODEX_CONTEXT_LENGTH_EXCEEDED_RE =
+  /(?:context[_\s-]?length[_\s-]?exceeded|context[_\s-]?window[_\s-]?exceeded|maximum\s+context\s+length|context\s+window\s+(?:too\s+long|exceeded|overflow|is\s+full)|input\s+(?:is\s+)?too\s+long\s+for\s+(?:this|the)\s+model|exceeds?\s+(?:the\s+)?(?:model'?s\s+)?(?:maximum\s+)?context\s+(?:window|length|size))/i;
 
 export function parseCodexJsonl(stdout: string) {
   let sessionId: string | null = null;
@@ -258,4 +263,17 @@ export function isCodexTransientUpstreamError(input: {
   // failure shape, plus explicit usage-limit windows that tell us when retrying
   // becomes safe again.
   return CODEX_REMOTE_COMPACTION_RE.test(haystack) || /high\s+demand|temporary\s+errors/i.test(haystack);
+}
+
+// Detect a context_length_exceeded outcome from Codex output. This is the trigger
+// for ARI-407 session rotation: the same persisted session cannot recover, so we
+// must drop it and force a fresh session on the next heartbeat.
+export function isCodexContextLengthExceededError(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = buildCodexErrorHaystack(input);
+  if (!haystack) return false;
+  return CODEX_CONTEXT_LENGTH_EXCEEDED_RE.test(haystack);
 }

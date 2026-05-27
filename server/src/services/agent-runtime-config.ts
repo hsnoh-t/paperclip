@@ -10,6 +10,12 @@ export const HEARTBEAT_AUTOPAUSE_CODES = [
   "invalid_api_key",
   "auth_failed",
   "adapter_bootstrap_failed",
+  // ARI-407: repeated context_length_exceeded on the same persisted session is a
+  // silent failure mode that ARI-103 must catch even when the adapter masks the
+  // run errorCode as "adapter_failed". See heartbeat-error-autopause.ts for the
+  // detection rules (direct errorCode match, haystack regex, and the 60-min/6
+  // sliding-window override that supplements the default 3-consecutive trigger).
+  "context_length_exceeded",
 ] as const;
 
 export type HeartbeatAutoPauseCode = (typeof HEARTBEAT_AUTOPAUSE_CODES)[number];
