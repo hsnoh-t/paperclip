@@ -105,6 +105,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { DONE_COMMENT_REOPEN_DUPLICATE_WINDOW_MS } from "../services/issue-comment-reopen-dedupe.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -806,6 +807,32 @@ function isAssigneeSelfCommentOnTerminalIssue(input: {
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   if (input.actorType !== "agent") return false;
   return input.actorId === input.assigneeAgentId;
+}
+
+async function findDuplicateDoneCommentReopenSuppression(input: {
+  issues: ReturnType<typeof issueService>;
+  issue: { id: string; status?: string | null };
+  actor: ReturnType<typeof getActorInfo>;
+  commentBody?: string | null;
+  explicitMoveToTodoRequested: boolean;
+  effectiveMoveToTodoRequested: boolean;
+}) {
+  if (!input.commentBody) return null;
+  if (input.issue.status !== "done") return null;
+  if (!input.effectiveMoveToTodoRequested || input.explicitMoveToTodoRequested) return null;
+  return input.issues.findRecentDuplicateCommentForReopen({
+    issueId: input.issue.id,
+    body: input.commentBody,
+    authorAgentId: input.actor.actorType === "agent" ? input.actor.agentId ?? null : null,
+    authorUserId: input.actor.actorType === "user" ? input.actor.actorId : null,
+    since: new Date(Date.now() - DONE_COMMENT_REOPEN_DUPLICATE_WINDOW_MS),
+  });
+}
+
+function formatCommentActivityTimestamp(value: Date | string | null | undefined) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
 }
 
 function queueResolvedInteractionContinuationWakeup(input: {
@@ -4902,11 +4929,21 @@ export function issueRoutes(
             executionRunId: existing.executionRunId,
           })) ||
         shouldResumeInProgressScheduledRetry);
+    const duplicateDoneCommentReopenSuppression = await findDuplicateDoneCommentReopenSuppression({
+      issues: svc,
+      issue: existing,
+      actor,
+      commentBody,
+      explicitMoveToTodoRequested,
+      effectiveMoveToTodoRequested,
+    });
+    const moveToTodoRequestedAfterReopenSuppression =
+      effectiveMoveToTodoRequested && !duplicateDoneCommentReopenSuppression;
     const updateReferenceSummaryBefore = titleOrDescriptionChanged
       ? await issueReferencesSvc.listIssueReferenceSummary(existing.id)
       : null;
     const hasUnresolvedFirstClassBlockers =
-      isBlocked && effectiveMoveToTodoRequested
+      isBlocked && moveToTodoRequestedAfterReopenSuppression
         ? (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0
         : false;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
@@ -4972,7 +5009,7 @@ export function issueRoutes(
     }
     if (
       commentBody &&
-      effectiveMoveToTodoRequested &&
+      moveToTodoRequestedAfterReopenSuppression &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry) &&
       updateFields.status === undefined
     ) {
@@ -5260,7 +5297,7 @@ export function issueRoutes(
     }
     const reopened =
       commentBody &&
-      effectiveMoveToTodoRequested &&
+      moveToTodoRequestedAfterReopenSuppression &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers)) &&
       previous.status !== undefined &&
       issue.status === "todo";
@@ -5311,6 +5348,14 @@ export function issueRoutes(
         ...(commentBody ? { source: "comment" } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
+        ...(duplicateDoneCommentReopenSuppression
+          ? {
+              reopenSuppressed: true,
+              reopenSuppressionReason: "duplicate_author_body_within_window",
+              duplicateCommentId: duplicateDoneCommentReopenSuppression.id,
+              suppressionWindowMs: DONE_COMMENT_REOPEN_DUPLICATE_WINDOW_MS,
+            }
+          : {}),
         ...(scheduledRetrySupersededByComment
           ? {
               scheduledRetrySupersededByComment: true,
@@ -5537,6 +5582,17 @@ export function issueRoutes(
           issueTitle: issue.title,
           ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
           ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+          ...(duplicateDoneCommentReopenSuppression
+            ? {
+                reopenSuppressed: true,
+                reopenSuppressionReason: "duplicate_author_body_within_window",
+                duplicateCommentId: duplicateDoneCommentReopenSuppression.id,
+                duplicateCommentCreatedAt: formatCommentActivityTimestamp(
+                  duplicateDoneCommentReopenSuppression.createdAt,
+                ),
+                suppressionWindowMs: DONE_COMMENT_REOPEN_DUPLICATE_WINDOW_MS,
+              }
+            : {}),
           ...(scheduledRetrySupersededByComment
             ? {
                 scheduledRetrySupersededByComment: true,
@@ -5553,6 +5609,32 @@ export function issueRoutes(
           }),
         },
       });
+
+      if (duplicateDoneCommentReopenSuppression) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.comment_reopen_suppressed",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            commentId: comment.id,
+            duplicateCommentId: duplicateDoneCommentReopenSuppression.id,
+            duplicateCommentCreatedAt: formatCommentActivityTimestamp(
+              duplicateDoneCommentReopenSuppression.createdAt,
+            ),
+            identifier: issue.identifier,
+            issueTitle: issue.title,
+            status: issue.status,
+            reason: "duplicate_author_body_within_window",
+            source: "comment",
+            suppressionWindowMs: DONE_COMMENT_REOPEN_DUPLICATE_WINDOW_MS,
+          },
+        });
+      }
 
       const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
         issue,
@@ -6679,8 +6761,18 @@ export function issueRoutes(
           executionRunId: issue.executionRunId,
         }) ||
         shouldResumeInProgressScheduledRetry);
+    const duplicateDoneCommentReopenSuppression = await findDuplicateDoneCommentReopenSuppression({
+      issues: svc,
+      issue,
+      actor,
+      commentBody: req.body.body,
+      explicitMoveToTodoRequested,
+      effectiveMoveToTodoRequested,
+    });
+    const moveToTodoRequestedAfterReopenSuppression =
+      effectiveMoveToTodoRequested && !duplicateDoneCommentReopenSuppression;
     const hasUnresolvedFirstClassBlockers =
-      isBlocked && effectiveMoveToTodoRequested
+      isBlocked && moveToTodoRequestedAfterReopenSuppression
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
         : false;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
@@ -6698,7 +6790,7 @@ export function issueRoutes(
     let scheduledRetrySupersededByComment = false;
     let cancelledScheduledRetryRunId: string | null = null;
     if (
-      effectiveMoveToTodoRequested &&
+      moveToTodoRequestedAfterReopenSuppression &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry)
     ) {
       scheduledRetrySupersededByComment = shouldResumeInProgressScheduledRetry && issue.status === "in_progress";
@@ -6945,6 +7037,17 @@ export function issueRoutes(
         issueTitle: currentIssue.title,
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+        ...(duplicateDoneCommentReopenSuppression
+          ? {
+              reopenSuppressed: true,
+              reopenSuppressionReason: "duplicate_author_body_within_window",
+              duplicateCommentId: duplicateDoneCommentReopenSuppression.id,
+              duplicateCommentCreatedAt: formatCommentActivityTimestamp(
+                duplicateDoneCommentReopenSuppression.createdAt,
+              ),
+              suppressionWindowMs: DONE_COMMENT_REOPEN_DUPLICATE_WINDOW_MS,
+            }
+          : {}),
         ...(scheduledRetrySupersededByComment
           ? {
               scheduledRetrySupersededByComment: true,
@@ -6960,6 +7063,32 @@ export function issueRoutes(
         }),
       },
     });
+
+    if (duplicateDoneCommentReopenSuppression) {
+      await logActivity(db, {
+        companyId: currentIssue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.comment_reopen_suppressed",
+        entityType: "issue",
+        entityId: currentIssue.id,
+        details: {
+          commentId: comment.id,
+          duplicateCommentId: duplicateDoneCommentReopenSuppression.id,
+          duplicateCommentCreatedAt: formatCommentActivityTimestamp(
+            duplicateDoneCommentReopenSuppression.createdAt,
+          ),
+          identifier: currentIssue.identifier,
+          issueTitle: currentIssue.title,
+          status: currentIssue.status,
+          reason: "duplicate_author_body_within_window",
+          source: "comment",
+          suppressionWindowMs: DONE_COMMENT_REOPEN_DUPLICATE_WINDOW_MS,
+        },
+      });
+    }
 
     const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
       currentIssue,

@@ -389,6 +389,93 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       .resolves.toEqual([]);
   });
 
+  it("finds recent duplicate reopen comments by same author and normalized body only", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const issueId = randomUUID();
+    const matchingCommentId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Done issue",
+      status: "done",
+      priority: "medium",
+      assigneeUserId: "local-board",
+    });
+
+    await db.insert(issueComments).values([
+      {
+        id: matchingCommentId,
+        companyId,
+        issueId,
+        authorUserId: "local-board",
+        authorType: "user",
+        body: "Heartbeat status\n\nunchanged",
+        createdAt: new Date("2026-06-14T02:10:00.000Z"),
+        updatedAt: new Date("2026-06-14T02:10:00.000Z"),
+      },
+      {
+        companyId,
+        issueId,
+        authorUserId: "other-board",
+        authorType: "user",
+        body: "Heartbeat status unchanged",
+        createdAt: new Date("2026-06-14T02:11:00.000Z"),
+        updatedAt: new Date("2026-06-14T02:11:00.000Z"),
+      },
+      {
+        companyId,
+        issueId,
+        authorUserId: "local-board",
+        authorType: "user",
+        body: "Heartbeat status unchanged with new evidence",
+        createdAt: new Date("2026-06-14T02:12:00.000Z"),
+        updatedAt: new Date("2026-06-14T02:12:00.000Z"),
+      },
+      {
+        companyId,
+        issueId,
+        authorUserId: "local-board",
+        authorType: "user",
+        body: "Old heartbeat status unchanged",
+        createdAt: new Date("2026-06-14T00:10:00.000Z"),
+        updatedAt: new Date("2026-06-14T00:10:00.000Z"),
+      },
+    ]);
+
+    await expect(svc.findRecentDuplicateCommentForReopen({
+      issueId,
+      body: "Heartbeat   status unchanged",
+      authorUserId: "local-board",
+      authorAgentId: null,
+      since: new Date("2026-06-14T02:00:00.000Z"),
+    })).resolves.toMatchObject({ id: matchingCommentId });
+
+    await expect(svc.findRecentDuplicateCommentForReopen({
+      issueId,
+      body: "Heartbeat status changed with new evidence",
+      authorUserId: "local-board",
+      authorAgentId: null,
+      since: new Date("2026-06-14T02:00:00.000Z"),
+    })).resolves.toBeNull();
+
+    await expect(svc.findRecentDuplicateCommentForReopen({
+      issueId,
+      body: "Heartbeat status unchanged with new evidence",
+      authorUserId: "third-board",
+      authorAgentId: null,
+      since: new Date("2026-06-14T02:00:00.000Z"),
+    })).resolves.toBeNull();
+
+    await expect(svc.findRecentDuplicateCommentForReopen({
+      issueId,
+      body: "Old heartbeat status unchanged",
+      authorUserId: "local-board",
+      authorAgentId: null,
+      since: new Date("2026-06-14T02:00:00.000Z"),
+    })).resolves.toBeNull();
+  });
+
   it("returns issues an agent participated in across the supported signals", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

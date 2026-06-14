@@ -68,6 +68,7 @@ import {
   parseProjectExecutionWorkspacePolicy,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { normalizeIssueCommentBodyForReopenDedupe } from "./issue-comment-reopen-dedupe.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -6007,6 +6008,42 @@ export function issueService(db: Db) {
       const { censorUsernameInLogs } = await instanceSettings.getGeneral();
       const enrichedComments = await enrichCommentsWithDerivedAgentAttribution(comments);
       return enrichedComments.map((comment) => redactIssueComment(comment, censorUsernameInLogs));
+    },
+
+    findRecentDuplicateCommentForReopen: async (input: {
+      issueId: string;
+      body: string;
+      authorAgentId?: string | null;
+      authorUserId?: string | null;
+      since: Date;
+      limit?: number | null;
+    }) => {
+      const normalizedBody = normalizeIssueCommentBodyForReopenDedupe(input.body);
+      const limit =
+        input.limit && input.limit > 0
+          ? Math.min(Math.floor(input.limit), 50)
+          : 20;
+      const comments = await db
+        .select()
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, input.issueId),
+          isNull(issueComments.deletedAt),
+          gt(issueComments.createdAt, input.since),
+          input.authorAgentId
+            ? eq(issueComments.authorAgentId, input.authorAgentId)
+            : isNull(issueComments.authorAgentId),
+          input.authorUserId
+            ? eq(issueComments.authorUserId, input.authorUserId)
+            : isNull(issueComments.authorUserId),
+        ))
+        .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+        .limit(limit);
+      const duplicate = comments.find((comment) =>
+        normalizeIssueCommentBodyForReopenDedupe(comment.body) === normalizedBody);
+      if (!duplicate) return null;
+      const { censorUsernameInLogs } = await instanceSettings.getGeneral();
+      return redactIssueComment(duplicate, censorUsernameInLogs);
     },
 
     getCommentCursor: async (issueId: string) => {

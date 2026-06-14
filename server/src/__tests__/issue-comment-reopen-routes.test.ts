@@ -7,6 +7,7 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
+  findRecentDuplicateCommentForReopen: vi.fn(),
   getDependencyReadiness: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   findMentionedAgents: vi.fn(),
@@ -229,6 +230,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.update.mockReset();
     mockIssueService.addComment.mockReset();
+    mockIssueService.findRecentDuplicateCommentForReopen.mockReset();
     mockIssueService.getDependencyReadiness.mockReset();
     mockIssueService.getCurrentScheduledRetry.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
@@ -304,6 +306,7 @@ describe.sequential("issue comment reopen routes", () => {
       authorAgentId: null,
       authorUserId: "local-board",
     });
+    mockIssueService.findRecentDuplicateCommentForReopen.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getDependencyReadiness.mockResolvedValue({
       issueId: "11111111-1111-4111-8111-111111111111",
@@ -520,6 +523,82 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  it("suppresses implicit POST reopen for repeated done-issue comments from the same author", async () => {
+    const duplicateCreatedAt = new Date("2026-06-14T02:10:00.000Z");
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.findRecentDuplicateCommentForReopen.mockResolvedValue({
+      id: "comment-previous",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "Heartbeat status unchanged",
+      createdAt: duplicateCreatedAt,
+      updatedAt: duplicateCreatedAt,
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-new",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "Heartbeat status unchanged",
+      createdAt: new Date("2026-06-14T02:12:00.000Z"),
+      updatedAt: new Date("2026-06-14T02:12:00.000Z"),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Heartbeat status unchanged" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.findRecentDuplicateCommentForReopen).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueId: "11111111-1111-4111-8111-111111111111",
+        body: "Heartbeat status unchanged",
+        authorAgentId: null,
+        authorUserId: "local-board",
+        since: expect.any(Date),
+      }),
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_reopen_suppressed",
+        details: expect.objectContaining({
+          commentId: "comment-new",
+          duplicateCommentId: "comment-previous",
+          duplicateCommentCreatedAt: "2026-06-14T02:10:00.000Z",
+          reason: "duplicate_author_body_within_window",
+        }),
+      }),
+    );
+  });
+
+  it("honors explicit POST reopen intent even when the comment body is repeated", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Heartbeat status unchanged", reopen: true });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.findRecentDuplicateCommentForReopen).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
   });
 
   it("rejects non-assignee agent POST comments on closed issues", async () => {
@@ -1120,6 +1199,55 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.objectContaining({ status: "todo" }),
+    );
+  });
+
+  it("suppresses implicit PATCH reopen for repeated done-issue comments from the same author", async () => {
+    const issue = makeIssue("done");
+    const duplicateCreatedAt = new Date("2026-06-14T02:10:00.000Z");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.findRecentDuplicateCommentForReopen.mockResolvedValue({
+      id: "comment-previous",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "No change since last heartbeat",
+      createdAt: duplicateCreatedAt,
+      updatedAt: duplicateCreatedAt,
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-new",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "No change since last heartbeat",
+      createdAt: new Date("2026-06-14T02:12:00.000Z"),
+      updatedAt: new Date("2026-06-14T02:12:00.000Z"),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "No change since last heartbeat" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update.mock.calls.find(([, patch]) => patch.status === "todo")).toBeUndefined();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_reopen_suppressed",
+        details: expect.objectContaining({
+          commentId: "comment-new",
+          duplicateCommentId: "comment-previous",
+          reason: "duplicate_author_body_within_window",
+        }),
+      }),
     );
   });
 
